@@ -61,3 +61,12 @@ def mock_session_manager():
     sm = MagicMock()
     sm.get_conversation_history.return_value = None
     return sm
+
+
+@pytest.fixture
+def mock_rag_system():
+    rag = MagicMock()
+    rag.query.return_value = ("Test answer", [])
+    rag.get_course_analytics.return_value = {"total_courses": 0, "course_titles": []}
+    rag.session_manager.create_session.return_value = "auto-session-id"
+    return rag
