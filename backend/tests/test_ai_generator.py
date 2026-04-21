@@ -176,7 +176,8 @@ def test_tool_use_message_structure():
     }
 
 
-def test_final_api_call_has_no_tools_key():
+def test_intermediate_api_calls_include_tools():
+    """After a tool round, tools remain available so Claude can chain calls."""
     first_response = _make_response(
         stop_reason="tool_use",
         content_blocks=[make_tool_use_block("search_course_content", {"query": "x"})],
@@ -195,8 +196,8 @@ def test_final_api_call_has_no_tools_key():
         )
 
     second_call_kwargs = mock_client.messages.create.call_args_list[1][1]
-    assert "tools" not in second_call_kwargs
-    assert "tool_choice" not in second_call_kwargs
+    assert "tools" in second_call_kwargs
+    assert "tool_choice" in second_call_kwargs
 
 
 def test_final_api_call_preserves_system_prompt():
@@ -274,3 +275,169 @@ def test_generate_response_returns_final_text_not_intermediate():
         )
 
     assert result == "Final synthesized answer"
+
+
+# ---------------------------------------------------------------------------
+# Group D: Sequential tool calling (2 rounds)
+# ---------------------------------------------------------------------------
+
+def test_two_sequential_tool_rounds_happy_path():
+    block1 = make_tool_use_block("search_course_content", {"query": "python basics"}, "id_r1")
+    block2 = make_tool_use_block("search_course_content", {"query": "python lesson 3"}, "id_r2")
+    resp1 = _make_response(stop_reason="tool_use", content_blocks=[block1])
+    resp2 = _make_response(stop_reason="tool_use", content_blocks=[block2])
+    resp3 = _make_response(stop_reason="end_turn", text="Final two-round answer")
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [resp1, resp2, resp3]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.return_value = "tool result"
+        generator = AIGenerator(api_key="test", model="claude-test")
+        result = generator.generate_response(
+            query="Find related content",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    assert mock_client.messages.create.call_count == 3
+    assert mock_tm.execute_tool.call_count == 2
+    assert result == "Final two-round answer"
+
+
+def test_round_cap_enforced_after_two_rounds():
+    """Loop stops after MAX_TOOL_ROUNDS even if Claude still returns tool_use."""
+    block = make_tool_use_block("search_course_content", {"query": "x"}, "id_x")
+    tool_resp = _make_response(stop_reason="tool_use", content_blocks=[block])
+    # Third response is also tool_use but the loop must not make a 4th call
+    last_resp = _make_response(stop_reason="tool_use", content_blocks=[make_text_block("cap hit")])
+    last_resp.content[0].type = "text"
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [tool_resp, tool_resp, last_resp]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.return_value = "result"
+        generator = AIGenerator(api_key="test", model="claude-test")
+        result = generator.generate_response(
+            query="Q",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    assert mock_client.messages.create.call_count == 3
+    assert mock_tm.execute_tool.call_count == 2
+    assert result == "cap hit"
+
+
+def test_tools_available_in_all_intermediate_calls():
+    block = make_tool_use_block("search_course_content", {"query": "A"}, "id_a")
+    resp1 = _make_response(stop_reason="tool_use", content_blocks=[block])
+    resp2 = _make_response(stop_reason="tool_use", content_blocks=[block])
+    resp3 = _make_response(stop_reason="end_turn", text="Done")
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [resp1, resp2, resp3]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.return_value = "result"
+        generator = AIGenerator(api_key="test", model="claude-test")
+        generator.generate_response(
+            query="Q",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    for call in mock_client.messages.create.call_args_list:
+        kwargs = call[1]
+        assert "tools" in kwargs
+        assert "tool_choice" in kwargs
+
+
+def test_two_round_message_structure():
+    block1 = make_tool_use_block("search_course_content", {"query": "A"}, "id_a")
+    block2 = make_tool_use_block("search_course_content", {"query": "B"}, "id_b")
+    resp1 = _make_response(stop_reason="tool_use", content_blocks=[block1])
+    resp2 = _make_response(stop_reason="tool_use", content_blocks=[block2])
+    resp3 = _make_response(stop_reason="end_turn", text="Done")
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [resp1, resp2, resp3]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.return_value = "result"
+        generator = AIGenerator(api_key="test", model="claude-test")
+        generator.generate_response(
+            query="two-round query",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    third_call_kwargs = mock_client.messages.create.call_args_list[2][1]
+    messages = third_call_kwargs["messages"]
+    assert len(messages) == 5
+    assert messages[0] == {"role": "user", "content": "two-round query"}
+    assert messages[1] == {"role": "assistant", "content": resp1.content}
+    assert messages[2]["role"] == "user"
+    assert messages[2]["content"][0]["tool_use_id"] == "id_a"
+    assert messages[3] == {"role": "assistant", "content": resp2.content}
+    assert messages[4]["role"] == "user"
+    assert messages[4]["content"][0]["tool_use_id"] == "id_b"
+
+
+def test_tool_exception_continues_execution():
+    block = make_tool_use_block("search_course_content", {"query": "x"}, "id_err")
+    resp1 = _make_response(stop_reason="tool_use", content_blocks=[block])
+    resp2 = _make_response(stop_reason="end_turn", text="Handled gracefully")
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [resp1, resp2]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.side_effect = RuntimeError("db unavailable")
+        generator = AIGenerator(api_key="test", model="claude-test")
+        result = generator.generate_response(
+            query="Q",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    assert result == "Handled gracefully"
+    assert mock_client.messages.create.call_count == 2
+    second_call_kwargs = mock_client.messages.create.call_args_list[1][1]
+    tool_result_content = second_call_kwargs["messages"][2]["content"][0]["content"]
+    assert "Tool error:" in tool_result_content
+
+
+def test_system_prompt_preserved_across_two_rounds():
+    block = make_tool_use_block("search_course_content", {"query": "x"}, "id_x")
+    resp1 = _make_response(stop_reason="tool_use", content_blocks=[block])
+    resp2 = _make_response(stop_reason="tool_use", content_blocks=[block])
+    resp3 = _make_response(stop_reason="end_turn", text="Done")
+
+    with patch("ai_generator.anthropic.Anthropic") as mock_cls:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.messages.create.side_effect = [resp1, resp2, resp3]
+        mock_tm = MagicMock()
+        mock_tm.execute_tool.return_value = "result"
+        generator = AIGenerator(api_key="test", model="claude-test")
+        generator.generate_response(
+            query="Q",
+            conversation_history="User: prior",
+            tools=[{"name": "search_course_content"}],
+            tool_manager=mock_tm,
+        )
+
+    systems = [call[1]["system"] for call in mock_client.messages.create.call_args_list]
+    assert systems[0] == systems[1] == systems[2]
+
+
+def test_system_prompt_allows_sequential_tool_calls():
+    assert "One search per query maximum" not in AIGenerator.SYSTEM_PROMPT
+    assert "2 sequential tool call" in AIGenerator.SYSTEM_PROMPT
